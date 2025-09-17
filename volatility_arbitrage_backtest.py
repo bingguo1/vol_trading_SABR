@@ -336,6 +336,9 @@ class OptionPosition:
     theta: float
     vega: float
     underlying_price: float
+    cur_price: float
+    prev_price: float
+    cur_date: datetime
 
 @dataclass
 class SABRParameters:
@@ -1445,7 +1448,10 @@ class VolatilityArbitrageStrategy:
             gamma=opportunity['gamma'],
             theta=opportunity['theta'],
             vega=opportunity['vega'],
-            underlying_price=opportunity['underlying_price']
+            underlying_price=opportunity['underlying_price'],
+            cur_price=opportunity['market_price'],  # Initialize current price
+            prev_price=opportunity['market_price'],  # Initialize previous price
+            cur_date=opportunity['trade_date']  # Initialize current date
         )
         
         self.positions[option_id] = position
@@ -1549,12 +1555,18 @@ class VolatilityArbitrageStrategy:
             end_str = self.end_date.strftime("%Y%m%d")
             position_hedge_file = f'position_hedge_details_{start_str}_{end_str}.csv'
             hedge_summary_file = f'hedge_summary_{start_str}_{end_str}.csv'
+            unified_position_file = f'unified_position_details_{start_str}_{end_str}.csv'
+            # Legacy files to clean up
+            position_details_file = f'position_details_{start_str}_{end_str}.csv'
         else:
             position_hedge_file = 'position_hedge_details.csv'
             hedge_summary_file = 'hedge_summary.csv'
+            unified_position_file = 'unified_position_details.csv'
+            # Legacy files to clean up
+            position_details_file = 'position_details.csv'
         
         # Remove files if they exist
-        files_to_remove = [position_hedge_file, hedge_summary_file]
+        files_to_remove = [position_hedge_file, hedge_summary_file, unified_position_file, position_details_file]
         
         for filename in files_to_remove:
             if os.path.exists(filename):
@@ -1563,6 +1575,50 @@ class VolatilityArbitrageStrategy:
                     logger.info(f"Removed existing CSV file: {filename}")
                 except Exception as e:
                     logger.warning(f"Could not remove file {filename}: {str(e)}")
+    
+    def _save_position_details(self, position_details):
+        """Save unified daily position details to CSV (combines position and hedging info)"""
+        if not position_details:
+            return
+        
+        import csv
+        import os
+        
+        # Create filename with date range
+        if self.start_date and self.end_date:
+            start_str = self.start_date.strftime("%Y%m%d")
+            end_str = self.end_date.strftime("%Y%m%d")
+            filename = f'unified_position_details_{start_str}_{end_str}.csv'
+        else:
+            filename = 'unified_position_details.csv'
+            
+        file_exists = os.path.exists(filename)
+        
+        with open(filename, 'a', newline='') as csvfile:
+            fieldnames = [
+                # Core position identification
+                'date', 'option_id', 'symbol', 'expiration_date', 'strike', 'option_type', 'quantity',
+                # Entry information
+                'entry_price', 'entry_date', 'entry_iv', 'predicted_iv', 'entry_value',
+                # Current pricing and P&L
+                'prev_price', 'cur_price', 'price_change', 'current_value', 'position_pnl',
+                # Time tracking
+                'days_held', 'days_to_expiry', 'time_to_maturity',
+                # Greeks and hedging
+                'current_delta', 'previous_delta', 'delta_change', 'delta_exposure',
+                'current_gamma', 'current_theta', 'current_vega', 'current_iv',
+                # Market context
+                'underlying_price', 'underlying_change'
+            ]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            # Write header if file is new
+            if not file_exists:
+                writer.writeheader()
+            
+            # Write all position details
+            for detail in position_details:
+                writer.writerow(detail)
     
     def daily_delta_hedge(self, current_date, calculate_greeks=False):
         """Perform daily delta hedging for all positions"""
@@ -1775,7 +1831,7 @@ class VolatilityArbitrageStrategy:
             self._save_hedge_summary(expiry_data)
     
     def calculate_portfolio_value(self, current_date):
-        """Calculate current portfolio value"""
+        """Calculate current portfolio value and update position prices"""
         if not self.positions:
             return self.cash
         summary=""
@@ -1799,7 +1855,10 @@ class VolatilityArbitrageStrategy:
         # Add stock position value
         portfolio_value += self.stock_position * current_underlying_price
         
-        # Add option positions value
+        # Collect position details for CSV logging
+        position_details = []
+        
+        # Add option positions value and update position prices
         sorted_positions = sorted([(oid, pos) for oid, pos in self.positions.items() if pos.quantity != 0], key=lambda x: x[0])
         for option_id, position in sorted_positions:
             option_data = current_data[
@@ -1813,6 +1872,81 @@ class VolatilityArbitrageStrategy:
                 position_value = position.quantity * current_price * 100
                 summary+=f"{option_id}:{position.quantity}*{current_price}*100={position_value}\n"
                 portfolio_value += position_value
+                
+                # Update position prices and date
+                position.prev_price = position.cur_price  # Save previous price
+                position.cur_price = current_price        # Update current price
+                position.cur_date = current_date          # Update current date
+                
+                # Calculate P&L for this position
+                entry_value = position.quantity * position.entry_price * 100
+                current_value = position_value
+                position_pnl = current_value - entry_value
+                
+                # Get current Greeks and IV from market data
+                current_option = option_data.iloc[0]
+                current_iv = current_option.get('iv', 0)
+                current_delta = current_option.get('delta', 0)
+                current_gamma = current_option.get('gamma', 0)
+                current_theta = current_option.get('theta', 0)
+                current_vega = current_option.get('vega', 0)
+                current_time_to_maturity = current_option.get('tte', 0)
+                
+                # Calculate delta exposure and changes
+                previous_delta = position.delta
+                delta_change = current_delta - previous_delta
+                delta_exposure = position.quantity * current_delta * 100
+                
+                # Calculate underlying price change (if we have previous data)
+                # For now, we'll use 0 as placeholder - this could be enhanced with historical tracking
+                underlying_change = 0
+                
+                # Collect unified position details for CSV
+                position_details.append({
+                    # Core position identification
+                    'date': current_date,
+                    'option_id': option_id,
+                    'symbol': position.symbol,
+                    'expiration_date': position.expiration_date,
+                    'strike': position.strike,
+                    'option_type': position.option_type,
+                    'quantity': position.quantity,
+                    # Entry information
+                    'entry_price': position.entry_price,
+                    'entry_date': position.entry_date,
+                    'entry_iv': position.entry_iv,
+                    'predicted_iv': position.predicted_iv,
+                    'entry_value': entry_value,
+                    # Current pricing and P&L
+                    'prev_price': position.prev_price,
+                    'cur_price': position.cur_price,
+                    'price_change': position.cur_price - position.prev_price,
+                    'current_value': current_value,
+                    'position_pnl': position_pnl,
+                    # Time tracking
+                    'days_held': (current_date - position.entry_date).days,
+                    'days_to_expiry': (position.expiration_date - current_date).days,
+                    'time_to_maturity': current_time_to_maturity,
+                    # Greeks and hedging
+                    'current_delta': current_delta,
+                    'previous_delta': previous_delta,
+                    'delta_change': delta_change,
+                    'delta_exposure': delta_exposure,
+                    'current_gamma': current_gamma,
+                    'current_theta': current_theta,
+                    'current_vega': current_vega,
+                    'current_iv': current_iv,
+                    # Market context
+                    'underlying_price': current_underlying_price,
+                    'underlying_change': underlying_change
+                })
+                
+                # Update position's stored delta for next day's calculation
+                position.delta = current_delta
+        
+        # Save position details to CSV
+        self._save_position_details(position_details)
+        
         print("Portfolio Summary:\n"+summary)
         return portfolio_value
     
