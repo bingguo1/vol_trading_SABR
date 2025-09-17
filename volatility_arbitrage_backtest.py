@@ -82,6 +82,8 @@ class LivePlotter:
         self.num_positions = []
         self.cash_values = []
         self.stock_values = []
+        self.underlying_prices = []
+        self.stock_positions = []
         self.buy_calls = []
         self.sell_calls = []
         self.buy_puts = []
@@ -93,8 +95,14 @@ class LivePlotter:
         self.fig.suptitle(self.title, fontsize=16)
         
         # Initialize empty plots
-        self.portfolio_line, = self.axes[0, 0].plot([], [], 'b-', linewidth=2)
+        self.portfolio_line, = self.axes[0, 0].plot([], [], 'b-', linewidth=2, label='Portfolio Value')
         self.pnl_line, = self.axes[0, 1].plot([], [], 'g-', linewidth=2)
+        
+        # Create secondary y-axis for portfolio plot (underlying price)
+        self.portfolio_ax2 = self.axes[0, 0].twinx()
+        self.portfolio_ax2.set_ylabel('Underlying Price ($)', color='orange')
+        self.portfolio_ax2.tick_params(axis='y', labelcolor='orange')
+        self.underlying_line, = self.portfolio_ax2.plot([], [], 'orange', linewidth=2, label='Underlying Price', alpha=0.7)
         
         # Positions plot with multiple lines and secondary y-axis
         self.total_positions_line, = self.axes[1, 0].plot([], [], 'k-', linewidth=2, label='Total')
@@ -120,15 +128,26 @@ class LivePlotter:
         self.buy_puts_line.remove()
         self.sell_puts_line.remove()
         
-        # Cash and stock plot
+        # Cash and stock plot with secondary y-axis
         self.cash_line, = self.axes[1, 1].plot([], [], 'm-', linewidth=2, label='Cash')
         self.stock_line, = self.axes[1, 1].plot([], [], 'orange', linewidth=2, label='Stock Value')
         
+        # Create secondary y-axis for cash & stock plot (stock position count)
+        self.cash_ax2 = self.axes[1, 1].twinx()
+        self.cash_ax2.set_ylabel('Stock Position (Shares)', color='brown')
+        self.cash_ax2.tick_params(axis='y', labelcolor='brown')
+        self.stock_position_line, = self.cash_ax2.plot([], [], 'brown', linewidth=2, label='Stock Position', alpha=0.7)
+        
         # Set up axis properties
         self.axes[0, 0].set_title('Portfolio Value Over Time')
-        self.axes[0, 0].set_ylabel('Portfolio Value ($)')
+        self.axes[0, 0].set_ylabel('Portfolio Value ($)', color='blue')
         self.axes[0, 0].grid(True, alpha=0.3)
         self.axes[0, 0].yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x/1e6:.1f}M'))
+        
+        # Setup portfolio plot legend with both axes
+        lines1, labels1 = self.axes[0, 0].get_legend_handles_labels()
+        lines2, labels2 = self.portfolio_ax2.get_legend_handles_labels()
+        self.axes[0, 0].legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=8)
         
         self.axes[0, 1].set_title('Cumulative P&L')
         self.axes[0, 1].set_ylabel('P&L ($)')
@@ -146,10 +165,14 @@ class LivePlotter:
         self.axes[1, 0].legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=8)
         
         self.axes[1, 1].set_title('Cash & Stock Positions')
-        self.axes[1, 1].set_ylabel('Value ($)')
+        self.axes[1, 1].set_ylabel('Value ($)', color='purple')
         self.axes[1, 1].grid(True, alpha=0.3)
         self.axes[1, 1].yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x/1e6:.1f}M'))
-        self.axes[1, 1].legend(loc='upper left', fontsize=8)
+        
+        # Setup cash & stock plot legend with both axes
+        lines3, labels3 = self.axes[1, 1].get_legend_handles_labels()
+        lines4, labels4 = self.cash_ax2.get_legend_handles_labels()
+        self.axes[1, 1].legend(lines3 + lines4, labels3 + labels4, loc='upper left', fontsize=8)
         
         # Format x-axis for dates
         for ax in self.axes.flat:
@@ -160,11 +183,13 @@ class LivePlotter:
         plt.tight_layout()
         plt.show(block=False)
         
-    def update_data(self, date, portfolio_value, pnl, num_positions, cash, stock_value, position_breakdown):
+    def update_data(self, date, portfolio_value, pnl, num_positions, cash, stock_value, position_breakdown, underlying_price, stock_position):
         """Update the data points
         
         Parameters:
         position_breakdown: dict with keys 'buy_calls', 'sell_calls', 'buy_puts', 'sell_puts'
+        underlying_price: current underlying asset price
+        stock_position: number of shares held
         """
         self.dates.append(date)
         self.portfolio_values.append(portfolio_value)
@@ -172,6 +197,8 @@ class LivePlotter:
         self.num_positions.append(num_positions)
         self.cash_values.append(cash)
         self.stock_values.append(stock_value)
+        self.underlying_prices.append(underlying_price)
+        self.stock_positions.append(stock_position)
         self.buy_calls.append(position_breakdown.get('buy_calls', 0))
         self.sell_calls.append(position_breakdown.get('sell_calls', 0))
         self.buy_puts.append(position_breakdown.get('buy_puts', 0))
@@ -185,7 +212,10 @@ class LivePlotter:
         # Update data for each line
         dates_num = mdates.date2num(self.dates)
         
+        # Portfolio plot - primary and secondary axes
         self.portfolio_line.set_data(dates_num, self.portfolio_values)
+        self.underlying_line.set_data(dates_num, self.underlying_prices)
+        
         self.pnl_line.set_data(dates_num, self.pnl_values)
         
         # Update positions lines
@@ -200,8 +230,9 @@ class LivePlotter:
         # Update cash and stock lines
         self.cash_line.set_data(dates_num, self.cash_values)
         self.stock_line.set_data(dates_num, self.stock_values)
+        self.stock_position_line.set_data(dates_num, self.stock_positions)
         
-        # Rescale axes including secondary axis
+        # Rescale primary axes
         for ax in self.axes.flat:
             ax.relim()
             ax.autoscale_view()
@@ -211,9 +242,15 @@ class LivePlotter:
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
             plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
         
-        # Also rescale the secondary axis
+        # Rescale secondary axes
+        self.portfolio_ax2.relim()
+        self.portfolio_ax2.autoscale_view()
+        
         self.positions_ax2.relim()
         self.positions_ax2.autoscale_view()
+        
+        self.cash_ax2.relim()
+        self.cash_ax2.autoscale_view()
         
         # Add latest values as text annotations
         if len(self.dates) > 0:
@@ -1365,7 +1402,7 @@ class VolatilityArbitrageStrategy:
                         'vega': vega,
                         'action': 'BUY' if iv_diff > 0 else 'SELL'  # Buy if underpriced, sell if overpriced
                     }
-                    print(f"Arbitrage opportunity: {opportunity}")
+                    # print(f"Arbitrage opportunity: {opportunity}")
                     opportunities.append(opportunity)
         
         return opportunities
@@ -1677,6 +1714,7 @@ class VolatilityArbitrageStrategy:
                         self.backtest_calibration_results = {}
                     self.backtest_calibration_results[trade_date] = sabr_params_by_maturity
             
+            current_underlying_price = self.options_data[self.options_data['trade_date'] == trade_date]['underlying_price'].median()
             if not sabr_params_by_maturity:
                 logger.debug(f"No SABR calibration successful for {trade_date}")
                 # Still update live plot with current portfolio value
@@ -1684,10 +1722,10 @@ class VolatilityArbitrageStrategy:
                     portfolio_value = self.calculate_portfolio_value(trade_date)
                     pnl = portfolio_value - initial_capital
                     num_positions = len([pos for pos in self.positions.values() if pos.quantity != 0])
-                    stock_value = self.stock_position * self.options_data['underlying_price'].median() if self.options_data is not None else 0
+                    stock_value = self.stock_position * current_underlying_price
                     position_breakdown = self.get_position_breakdown()
                     
-                    self.live_plotter.update_data(trade_date, portfolio_value, pnl, num_positions, self.cash, stock_value, position_breakdown)
+                    self.live_plotter.update_data(trade_date, portfolio_value, pnl, num_positions, self.cash, stock_value, position_breakdown, current_underlying_price, self.stock_position)
                     self.live_plotter.update_plots()
                     
                     # Add small delay to allow plot updates
@@ -1713,16 +1751,17 @@ class VolatilityArbitrageStrategy:
                 'pnl': pnl,
                 'cash': self.cash,
                 'stock_position': self.stock_position,
-                'num_positions': num_positions
+                'num_positions': num_positions,
+                'underlying_price': current_underlying_price,
             })
             
             # Update live plot if enabled
             if live_plotting and self.live_plotter:
-                current_underlying_price = self.options_data['underlying_price'].median() if self.options_data is not None else 2800  # fallback price
                 stock_value = self.stock_position * current_underlying_price
                 position_breakdown = self.get_position_breakdown()
+                print(f"============= {trade_date.strftime('%Y-%m-%d')}, current_underlying_price: {current_underlying_price} =============")
                 
-                self.live_plotter.update_data(trade_date, portfolio_value, pnl, num_positions, self.cash, stock_value, position_breakdown)
+                self.live_plotter.update_data(trade_date, portfolio_value, pnl, num_positions, self.cash, stock_value, position_breakdown, current_underlying_price, self.stock_position)
                 self.live_plotter.update_plots()
                 
                 # Add small delay to allow plot updates
