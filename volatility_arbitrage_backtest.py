@@ -559,7 +559,9 @@ class VolatilityArbitrageStrategy:
                  risk_free_rate=0.02,
                  transaction_cost=0.005,  # 0.5% transaction cost
                  max_position_size=100,
-                 delta_hedge_threshold=0.1):
+                 delta_hedge_threshold=0.1,
+                 start_date=None,
+                 end_date=None):
         """
         Initialize the volatility arbitrage strategy
         
@@ -569,12 +571,16 @@ class VolatilityArbitrageStrategy:
         transaction_cost: Transaction cost as percentage of notional
         max_position_size: Maximum position size per trade
         delta_hedge_threshold: Delta threshold for rehedging
+        start_date: Start date for backtest (for CSV naming)
+        end_date: End date for backtest (for CSV naming)
         """
         self.iv_threshold = iv_threshold
         self.risk_free_rate = risk_free_rate
         self.transaction_cost = transaction_cost
         self.max_position_size = max_position_size
         self.delta_hedge_threshold = delta_hedge_threshold
+        self.start_date = start_date
+        self.end_date = end_date
         
         self.sabr_model = SABRModel()
         self.positions = {}
@@ -1444,16 +1450,11 @@ class VolatilityArbitrageStrategy:
         
         self.positions[option_id] = position
         
-        # Update cash position
+        # Update cash position (no individual delta hedging - will be handled by daily_delta_hedge)
         cash_flow = -quantity * opportunity['market_price'] * 100 - transaction_cost
         self.cash += cash_flow
         
-        # Initial delta hedge
-        hedge_shares = -quantity * opportunity['delta'] * 100
-        self.stock_position += hedge_shares
-        self.cash -= hedge_shares * opportunity['underlying_price']
-        
-        # Log trade
+        # Log trade (no individual hedging recorded)
         trade_record = {
             'date': opportunity['trade_date'],
             'action': action,
@@ -1461,7 +1462,7 @@ class VolatilityArbitrageStrategy:
             'quantity': quantity,
             'price': opportunity['market_price'],
             'iv_diff': opportunity['iv_diff'],
-            'delta_hedge': hedge_shares,
+            'delta_hedge': 0,  # No individual hedging
             'cash_flow': cash_flow,
             'transaction_cost': transaction_cost
         }
@@ -1469,13 +1470,102 @@ class VolatilityArbitrageStrategy:
         self.trade_log.append(trade_record)
         
         logger.info(f"Executed {action} {abs(quantity)} {option_id} @ {opportunity['market_price']:.2f}, "
-                   f"IV diff: {opportunity['iv_diff']:.1%}, Delta hedge: {hedge_shares:.0f} shares (delta: {opportunity['delta']:.3f}), underlyingP:{opportunity['underlying_price']}, ")
+                   f"IV diff: {opportunity['iv_diff']:.1%}, (delta: {opportunity['delta']:.3f}), underlyingP:{opportunity['underlying_price']}, ")
+    
+    def _save_position_hedge_details(self, position_details):
+        """Save individual position hedge details to CSV"""
+        if not position_details:
+            return
+            
+        import csv
+        import os
+        
+        # Create filename with date range
+        if self.start_date and self.end_date:
+            start_str = self.start_date.strftime("%Y%m%d")
+            end_str = self.end_date.strftime("%Y%m%d") 
+            filename = f'position_hedge_details_{start_str}_{end_str}.csv'
+        else:
+            filename = 'position_hedge_details.csv'
+            
+        file_exists = os.path.exists(filename)
+        
+        with open(filename, 'a', newline='') as csvfile:
+            fieldnames = [
+                'date', 'option_id', 'quantity', 'strike', 'option_type', 
+                'expiration_date', 'time_to_maturity', 'current_delta', 
+                'previous_delta', 'delta_exposure', 'current_price', 
+                'current_iv', 'underlying_price'
+            ]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            # Write header if file is new
+            if not file_exists:
+                writer.writeheader()
+            
+            # Write all position details
+            for detail in position_details:
+                writer.writerow(detail)
+    
+    def _save_hedge_summary(self, summary_data):
+        """Save hedge summary data to CSV"""
+        import csv
+        import os
+        
+        # Create filename with date range
+        if self.start_date and self.end_date:
+            start_str = self.start_date.strftime("%Y%m%d")
+            end_str = self.end_date.strftime("%Y%m%d")
+            filename = f'hedge_summary_{start_str}_{end_str}.csv'
+        else:
+            filename = 'hedge_summary.csv'
+            
+        file_exists = os.path.exists(filename)
+        
+        with open(filename, 'a', newline='') as csvfile:
+            fieldnames = [
+                'date', 'action_type', 'total_delta_exposure', 'current_stock_position',
+                'total_delta_adjustment', 'threshold_shares', 'hedge_executed',
+                'underlying_price', 'num_positions', 'old_stock_position',
+                'new_stock_position', 'stock_adjustment', 'cash_flow',
+                'option_id', 'payoff', 'expiration_date', 'strike', 'option_type',
+                'quantity', 'final_underlying'  # Additional fields for expired positions
+            ]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
+            
+            # Write header if file is new
+            if not file_exists:
+                writer.writeheader()
+            
+            writer.writerow(summary_data)
+    
+    def _cleanup_existing_csv_files(self):
+        """Remove existing CSV files to ensure fresh logs for new backtest"""
+        import os
+        
+        # Generate filenames for cleanup
+        if self.start_date and self.end_date:
+            start_str = self.start_date.strftime("%Y%m%d")
+            end_str = self.end_date.strftime("%Y%m%d")
+            position_hedge_file = f'position_hedge_details_{start_str}_{end_str}.csv'
+            hedge_summary_file = f'hedge_summary_{start_str}_{end_str}.csv'
+        else:
+            position_hedge_file = 'position_hedge_details.csv'
+            hedge_summary_file = 'hedge_summary.csv'
+        
+        # Remove files if they exist
+        files_to_remove = [position_hedge_file, hedge_summary_file]
+        
+        for filename in files_to_remove:
+            if os.path.exists(filename):
+                try:
+                    os.remove(filename)
+                    logger.info(f"Removed existing CSV file: {filename}")
+                except Exception as e:
+                    logger.warning(f"Could not remove file {filename}: {str(e)}")
     
     def daily_delta_hedge(self, current_date, calculate_greeks=False):
         """Perform daily delta hedging for all positions"""
-        if not self.positions:
-            return
-        
         # Ensure correct data is loaded for this date
         if not self.ensure_data_loaded_for_date(current_date):
             logger.warning(f"Could not load data for delta hedging on date: {current_date}")
@@ -1487,11 +1577,15 @@ class VolatilityArbitrageStrategy:
         if len(current_data) == 0:
             return
         
-        total_delta_adjustment = 0
+        # Calculate total current delta exposure across all positions
+        total_current_delta_exposure = 0
+        positions_updated = []
+        position_details = []  # For CSV logging
         
         for position in self.positions.values():
             if position.quantity == 0:
                 continue
+                
             # Find current option data
             option_data = current_data[
                 (current_data['expiration_date'] == position.expiration_date) &
@@ -1531,23 +1625,89 @@ class VolatilityArbitrageStrategy:
                     risk_free_rate, current_iv, position.option_type
                 )
             
-            # Calculate delta adjustment needed
+            # Calculate delta exposure for this position
             delta_exposure = position.quantity * current_delta * 100
-            previous_delta_exposure = position.quantity * position.delta * 100
-            delta_adjustment = delta_exposure - previous_delta_exposure
+            total_current_delta_exposure += delta_exposure
             
-            # Only hedge if adjustment exceeds threshold
-            if abs(delta_adjustment) > self.delta_hedge_threshold * abs(position.quantity) * 100:
-                total_delta_adjustment += delta_adjustment
-                position.delta = current_delta  # Update stored delta
+            # Store updated delta for this position
+            positions_updated.append((position, current_delta))
+            
+            # Log position details for CSV
+            option_id = f"{position.expiration_date.strftime('%Y%m%d')}_{position.strike}_{position.option_type}"
+            position_details.append({
+                'date': current_date,
+                'option_id': option_id,
+                'quantity': position.quantity,
+                'strike': position.strike,
+                'option_type': position.option_type,
+                'expiration_date': position.expiration_date,
+                'time_to_maturity': current_time_to_maturity,
+                'current_delta': current_delta,
+                'previous_delta': position.delta,
+                'delta_exposure': delta_exposure,
+                'current_price': current_market_price,
+                'current_iv': current_iv,
+                'underlying_price': current_underlying
+            })
         
-        # Execute delta hedge
-        if abs(total_delta_adjustment) > 0:
-            current_underlying_price = current_data['underlying_price'].median()
+        # Save position details to CSV
+        self._save_position_hedge_details(position_details)
+        
+        # Calculate total delta adjustment needed
+        # Current stock position should neutralize the delta exposure
+        total_delta_adjustment = total_current_delta_exposure + self.stock_position
+        
+        # Prepare summary data for CSV logging
+        hedge_executed = abs(total_delta_adjustment) > self.delta_hedge_threshold * 100
+        current_underlying_price = current_data['underlying_price'].median()
+        
+        # Log summary data
+        summary_data = {
+            'date': current_date,
+            'total_delta_exposure': total_current_delta_exposure,
+            'current_stock_position': self.stock_position,
+            'total_delta_adjustment': total_delta_adjustment,
+            'threshold_shares': self.delta_hedge_threshold * 100,
+            'hedge_executed': hedge_executed,
+            'underlying_price': current_underlying_price,
+            'num_positions': len(position_details),
+            'action_type': 'delta_hedge'
+        }
+        
+        # Execute delta hedge if adjustment exceeds threshold
+        if hedge_executed:
+            # Adjust stock position to neutralize delta
+            old_stock_position = self.stock_position
             self.stock_position -= total_delta_adjustment
-            self.cash += total_delta_adjustment * current_underlying_price
+            cash_flow = total_delta_adjustment * current_underlying_price
+            self.cash += cash_flow
             
-            logger.debug(f"Delta hedge: {total_delta_adjustment:.0f} shares @ {current_underlying_price:.2f}")
+            # Update stored deltas for all positions
+            for position, current_delta in positions_updated:
+                position.delta = current_delta
+            
+            # Update summary data with execution details
+            summary_data.update({
+                'old_stock_position': old_stock_position,
+                'new_stock_position': self.stock_position,
+                'stock_adjustment': -total_delta_adjustment,
+                'cash_flow': cash_flow
+            })
+            
+            logger.debug(f"Delta hedge: {total_delta_adjustment:.0f} shares @ {current_underlying_price:.2f}, "
+                        f"Total delta exposure: {total_current_delta_exposure:.0f}, "
+                        f"New stock position: {self.stock_position:.0f}")
+        else:
+            # No hedge executed
+            summary_data.update({
+                'old_stock_position': self.stock_position,
+                'new_stock_position': self.stock_position,
+                'stock_adjustment': 0,
+                'cash_flow': 0
+            })
+        
+        # Save summary to CSV
+        self._save_hedge_summary(summary_data)
     
     def close_expired_positions(self, current_date):
         """Close positions that have expired"""
@@ -1563,6 +1723,10 @@ class VolatilityArbitrageStrategy:
             position = self.positions.pop(option_id)
             
             # Calculate final payoff
+            payoff = 0
+            cash_flow = 0
+            final_underlying = 0
+            
             # Ensure data is loaded for expiration calculation
             if self.ensure_data_loaded_for_date(current_date):
                 current_data = self.options_data[
@@ -1583,6 +1747,32 @@ class VolatilityArbitrageStrategy:
                     
                     logger.info(f"Expired: {option_id}, Payoff: {payoff:.2f}, "
                                f"Cash flow: {cash_flow:.2f}")
+            
+            # Log expired position to CSV
+            expiry_data = {
+                'date': current_date,
+                'action_type': 'position_expiry',
+                'option_id': option_id,
+                'expiration_date': position.expiration_date,
+                'payoff': payoff,
+                'cash_flow': cash_flow,
+                'quantity': position.quantity,
+                'strike': position.strike,
+                'option_type': position.option_type,
+                'final_underlying': final_underlying,
+                'total_delta_exposure': 0,  # Not applicable for expiry
+                'current_stock_position': self.stock_position,
+                'total_delta_adjustment': 0,  # Not applicable for expiry
+                'threshold_shares': 0,  # Not applicable for expiry
+                'hedge_executed': False,  # Not applicable for expiry
+                'underlying_price': final_underlying,
+                'num_positions': 1,
+                'old_stock_position': self.stock_position,
+                'new_stock_position': self.stock_position,
+                'stock_adjustment': 0
+            }
+            
+            self._save_hedge_summary(expiry_data)
     
     def calculate_portfolio_value(self, current_date):
         """Calculate current portfolio value"""
@@ -1682,6 +1872,9 @@ class VolatilityArbitrageStrategy:
         
         logger.info(f"Backtesting from {trading_dates[0]} to {trading_dates[-1]}")
         
+        # Clean up existing CSV files to ensure fresh logs
+        self._cleanup_existing_csv_files()
+        
         initial_capital = 1000000  # $1M initial capital
         self.cash = initial_capital
         
@@ -1690,10 +1883,6 @@ class VolatilityArbitrageStrategy:
             
             # Close expired positions
             self.close_expired_positions(trade_date)
-            
-            # Daily delta hedging
-            if i > 0:  # Skip first day
-                self.daily_delta_hedge(trade_date)
             
             # Get SABR calibration results
             if precomputed_calibration and trade_date in precomputed_calibration:
@@ -1739,6 +1928,11 @@ class VolatilityArbitrageStrategy:
             opportunities.sort(key=lambda x: abs(x['iv_diff']), reverse=True)
             for opportunity in opportunities[:5]:  # Top 5 opportunities per day
                 self.execute_trade(opportunity)
+            
+            # Daily delta hedging AFTER executing trades
+            # Always run delta hedging to ensure proper portfolio balance
+            # (even when positions net to zero, stock position should be adjusted)
+            self.daily_delta_hedge(trade_date)
             
             # Calculate and record portfolio value
             portfolio_value = self.calculate_portfolio_value(trade_date)
@@ -1916,7 +2110,9 @@ def main():
         risk_free_rate=config['risk_free_rate'],
         transaction_cost=config['transaction_cost'],
         max_position_size=config['max_position_size'],
-        delta_hedge_threshold=config['delta_hedge_threshold']
+        delta_hedge_threshold=config['delta_hedge_threshold'],
+        start_date=start_date,
+        end_date=end_date
     )
     
     # Load data
