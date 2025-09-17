@@ -81,6 +81,11 @@ class LivePlotter:
         self.pnl_values = []
         self.num_positions = []
         self.cash_values = []
+        self.stock_values = []
+        self.buy_calls = []
+        self.sell_calls = []
+        self.buy_puts = []
+        self.sell_puts = []
         
         # Set up the figure and axes
         plt.ion()  # Turn on interactive mode
@@ -90,8 +95,34 @@ class LivePlotter:
         # Initialize empty plots
         self.portfolio_line, = self.axes[0, 0].plot([], [], 'b-', linewidth=2)
         self.pnl_line, = self.axes[0, 1].plot([], [], 'g-', linewidth=2)
-        self.positions_line, = self.axes[1, 0].plot([], [], 'r-', linewidth=2)
-        self.cash_line, = self.axes[1, 1].plot([], [], 'm-', linewidth=2)
+        
+        # Positions plot with multiple lines and secondary y-axis
+        self.total_positions_line, = self.axes[1, 0].plot([], [], 'k-', linewidth=2, label='Total')
+        self.buy_calls_line, = self.axes[1, 0].plot([], [], 'b-', linewidth=1.5, label='Buy Calls')
+        self.sell_calls_line, = self.axes[1, 0].plot([], [], 'b--', linewidth=1.5, label='Sell Calls')
+        self.buy_puts_line, = self.axes[1, 0].plot([], [], 'r-', linewidth=1.5, label='Buy Puts')
+        self.sell_puts_line, = self.axes[1, 0].plot([], [], 'r--', linewidth=1.5, label='Sell Puts')
+        
+        # Create secondary y-axis for positions
+        self.positions_ax2 = self.axes[1, 0].twinx()
+        self.positions_ax2.set_ylabel('Individual Position Types', color='gray')
+        self.positions_ax2.tick_params(axis='y', labelcolor='gray')
+        
+        # Move individual position lines to secondary axis
+        self.buy_calls_line_right, = self.positions_ax2.plot([], [], 'b-', linewidth=1.5, label='Buy Calls', alpha=0.7)
+        self.sell_calls_line_right, = self.positions_ax2.plot([], [], 'b--', linewidth=1.5, label='Sell Calls', alpha=0.7)
+        self.buy_puts_line_right, = self.positions_ax2.plot([], [], 'r-', linewidth=1.5, label='Buy Puts', alpha=0.7)
+        self.sell_puts_line_right, = self.positions_ax2.plot([], [], 'r--', linewidth=1.5, label='Sell Puts', alpha=0.7)
+        
+        # Keep only total on left axis
+        self.buy_calls_line.remove()
+        self.sell_calls_line.remove() 
+        self.buy_puts_line.remove()
+        self.sell_puts_line.remove()
+        
+        # Cash and stock plot
+        self.cash_line, = self.axes[1, 1].plot([], [], 'm-', linewidth=2, label='Cash')
+        self.stock_line, = self.axes[1, 1].plot([], [], 'orange', linewidth=2, label='Stock Value')
         
         # Set up axis properties
         self.axes[0, 0].set_title('Portfolio Value Over Time')
@@ -104,14 +135,21 @@ class LivePlotter:
         self.axes[0, 1].grid(True, alpha=0.3)
         self.axes[0, 1].yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x/1e3:.0f}K'))
         
-        self.axes[1, 0].set_title('Number of Open Positions')
-        self.axes[1, 0].set_ylabel('Positions')
+        self.axes[1, 0].set_title('Options Positions by Type')
+        self.axes[1, 0].set_ylabel('Total Positions', color='black')
         self.axes[1, 0].grid(True, alpha=0.3)
+        self.axes[1, 0].legend(loc='upper left', fontsize=8)
         
-        self.axes[1, 1].set_title('Cash Position')
-        self.axes[1, 1].set_ylabel('Cash ($)')
+        # Setup secondary axis legend
+        lines1, labels1 = self.axes[1, 0].get_legend_handles_labels()
+        lines2, labels2 = self.positions_ax2.get_legend_handles_labels()
+        self.axes[1, 0].legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=8)
+        
+        self.axes[1, 1].set_title('Cash & Stock Positions')
+        self.axes[1, 1].set_ylabel('Value ($)')
         self.axes[1, 1].grid(True, alpha=0.3)
         self.axes[1, 1].yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x/1e6:.1f}M'))
+        self.axes[1, 1].legend(loc='upper left', fontsize=8)
         
         # Format x-axis for dates
         for ax in self.axes.flat:
@@ -122,13 +160,22 @@ class LivePlotter:
         plt.tight_layout()
         plt.show(block=False)
         
-    def update_data(self, date, portfolio_value, pnl, num_positions, cash):
-        """Update the data points"""
+    def update_data(self, date, portfolio_value, pnl, num_positions, cash, stock_value, position_breakdown):
+        """Update the data points
+        
+        Parameters:
+        position_breakdown: dict with keys 'buy_calls', 'sell_calls', 'buy_puts', 'sell_puts'
+        """
         self.dates.append(date)
         self.portfolio_values.append(portfolio_value)
         self.pnl_values.append(pnl)
         self.num_positions.append(num_positions)
         self.cash_values.append(cash)
+        self.stock_values.append(stock_value)
+        self.buy_calls.append(position_breakdown.get('buy_calls', 0))
+        self.sell_calls.append(position_breakdown.get('sell_calls', 0))
+        self.buy_puts.append(position_breakdown.get('buy_puts', 0))
+        self.sell_puts.append(position_breakdown.get('sell_puts', 0))
         
     def update_plots(self):
         """Update all plots with new data"""
@@ -136,14 +183,26 @@ class LivePlotter:
             return
             
         # Update data for each line
-        self.portfolio_line.set_data(mdates.date2num(self.dates), self.portfolio_values)
-        self.pnl_line.set_data(mdates.date2num(self.dates), self.pnl_values)
-        self.positions_line.set_data(mdates.date2num(self.dates), self.num_positions)
-        self.cash_line.set_data(mdates.date2num(self.dates), self.cash_values)
+        dates_num = mdates.date2num(self.dates)
         
-        # Rescale axes
-        for ax, line in zip(self.axes.flat, 
-                           [self.portfolio_line, self.pnl_line, self.positions_line, self.cash_line]):
+        self.portfolio_line.set_data(dates_num, self.portfolio_values)
+        self.pnl_line.set_data(dates_num, self.pnl_values)
+        
+        # Update positions lines
+        self.total_positions_line.set_data(dates_num, self.num_positions)
+        
+        # Update individual position lines on secondary axis
+        self.buy_calls_line_right.set_data(dates_num, self.buy_calls)
+        self.sell_calls_line_right.set_data(dates_num, self.sell_calls)
+        self.buy_puts_line_right.set_data(dates_num, self.buy_puts)
+        self.sell_puts_line_right.set_data(dates_num, self.sell_puts)
+        
+        # Update cash and stock lines
+        self.cash_line.set_data(dates_num, self.cash_values)
+        self.stock_line.set_data(dates_num, self.stock_values)
+        
+        # Rescale axes including secondary axis
+        for ax in self.axes.flat:
             ax.relim()
             ax.autoscale_view()
             
@@ -152,6 +211,10 @@ class LivePlotter:
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
             plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
         
+        # Also rescale the secondary axis
+        self.positions_ax2.relim()
+        self.positions_ax2.autoscale_view()
+        
         # Add latest values as text annotations
         if len(self.dates) > 0:
             latest_date = self.dates[-1].strftime('%Y-%m-%d')
@@ -159,6 +222,11 @@ class LivePlotter:
             latest_pnl = self.pnl_values[-1]
             latest_positions = self.num_positions[-1]
             latest_cash = self.cash_values[-1]
+            latest_stock = self.stock_values[-1]
+            latest_buy_calls = self.buy_calls[-1]
+            latest_sell_calls = self.sell_calls[-1]
+            latest_buy_puts = self.buy_puts[-1]
+            latest_sell_puts = self.sell_puts[-1]
             
             # Clear previous annotations and add new ones
             for ax in self.axes.flat:
@@ -182,14 +250,16 @@ class LivePlotter:
             txt._live_annotation = True
             
             # Positions annotation
-            txt = self.axes[1, 0].text(0.02, 0.98, f'Latest: {latest_positions}', 
+            positions_text = f'Total: {latest_positions}\nBuy Calls: {latest_buy_calls}\nSell Calls: {latest_sell_calls}\nBuy Puts: {latest_buy_puts}\nSell Puts: {latest_sell_puts}'
+            txt = self.axes[1, 0].text(0.02, 0.98, positions_text, 
                                       transform=self.axes[1, 0].transAxes, 
                                       verticalalignment='top',
                                       bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
             txt._live_annotation = True
             
-            # Cash annotation
-            txt = self.axes[1, 1].text(0.02, 0.98, f'Latest: ${latest_cash:,.0f}', 
+            # Cash and stock annotation
+            cash_stock_text = f'Cash: ${latest_cash:,.0f}\nStock: ${latest_stock:,.0f}\nTotal: ${latest_cash + latest_stock:,.0f}'
+            txt = self.axes[1, 1].text(0.02, 0.98, cash_stock_text, 
                                       transform=self.axes[1, 1].transAxes, 
                                       verticalalignment='top',
                                       bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
@@ -1444,15 +1514,16 @@ class VolatilityArbitrageStrategy:
     
     def close_expired_positions(self, current_date):
         """Close positions that have expired"""
-        expired_positions = []
+        expired_option_ids = []
         
-        for i, position in enumerate(self.positions.values()):
+        # Find expired positions
+        for option_id, position in self.positions.items():
             if position.expiration_date <= current_date:
-                expired_positions.append(i)
+                expired_option_ids.append(option_id)
         
-        # Remove expired positions (in reverse order to maintain indices)
-        for i in reversed(expired_positions):
-            position = self.positions.pop(i)
+        # Remove expired positions
+        for option_id in expired_option_ids:
+            position = self.positions.pop(option_id)
             
             # Calculate final payoff
             # Ensure data is loaded for expiration calculation
@@ -1473,7 +1544,7 @@ class VolatilityArbitrageStrategy:
                     cash_flow = position.quantity * payoff * 100
                     self.cash += cash_flow
                     
-                    logger.info(f"Expired: {position.option_id}, Payoff: {payoff:.2f}, "
+                    logger.info(f"Expired: {option_id}, Payoff: {payoff:.2f}, "
                                f"Cash flow: {cash_flow:.2f}")
     
     def calculate_portfolio_value(self, current_date):
@@ -1517,6 +1588,32 @@ class VolatilityArbitrageStrategy:
                 portfolio_value += position_value
         print("Portfolio Summary:\n"+summary)
         return portfolio_value
+    
+    def get_position_breakdown(self):
+        """Get breakdown of positions by type"""
+        breakdown = {
+            'buy_calls': 0,
+            'sell_calls': 0,
+            'buy_puts': 0,
+            'sell_puts': 0
+        }
+        
+        for position in self.positions.values():
+            if position.quantity == 0:
+                continue
+                
+            if position.option_type == 'C':  # Calls
+                if position.quantity > 0:
+                    breakdown['buy_calls'] += abs(position.quantity)
+                else:
+                    breakdown['sell_calls'] += abs(position.quantity)
+            else:  # Puts
+                if position.quantity > 0:
+                    breakdown['buy_puts'] += abs(position.quantity)
+                else:
+                    breakdown['sell_puts'] += abs(position.quantity)
+        
+        return breakdown
     
     def run_backtest(self, start_date=None, end_date=None, calibration_file=None, save_plots=False, live_plotting=False):
         """
@@ -1587,8 +1684,10 @@ class VolatilityArbitrageStrategy:
                     portfolio_value = self.calculate_portfolio_value(trade_date)
                     pnl = portfolio_value - initial_capital
                     num_positions = len([pos for pos in self.positions.values() if pos.quantity != 0])
+                    stock_value = self.stock_position * self.options_data['underlying_price'].median() if self.options_data is not None else 0
+                    position_breakdown = self.get_position_breakdown()
                     
-                    self.live_plotter.update_data(trade_date, portfolio_value, pnl, num_positions, self.cash)
+                    self.live_plotter.update_data(trade_date, portfolio_value, pnl, num_positions, self.cash, stock_value, position_breakdown)
                     self.live_plotter.update_plots()
                     
                     # Add small delay to allow plot updates
@@ -1619,7 +1718,11 @@ class VolatilityArbitrageStrategy:
             
             # Update live plot if enabled
             if live_plotting and self.live_plotter:
-                self.live_plotter.update_data(trade_date, portfolio_value, pnl, num_positions, self.cash)
+                current_underlying_price = self.options_data['underlying_price'].median() if self.options_data is not None else 2800  # fallback price
+                stock_value = self.stock_position * current_underlying_price
+                position_breakdown = self.get_position_breakdown()
+                
+                self.live_plotter.update_data(trade_date, portfolio_value, pnl, num_positions, self.cash, stock_value, position_breakdown)
                 self.live_plotter.update_plots()
                 
                 # Add small delay to allow plot updates
