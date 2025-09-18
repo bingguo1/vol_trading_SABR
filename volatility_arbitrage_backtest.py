@@ -338,6 +338,7 @@ class OptionPosition:
     underlying_price: float
     cur_price: float
     prev_price: float
+    prev_quantity: int
     cur_date: datetime
 
 @dataclass
@@ -560,7 +561,7 @@ class VolatilityArbitrageStrategy:
     def __init__(self, 
                  iv_threshold=0.02,  # 2% IV difference threshold
                  risk_free_rate=0.02,
-                 transaction_cost=0.005,  # 0.5% transaction cost
+                 transaction_cost=0.0001,  # 0.5% transaction cost
                  max_position_size=100,
                  delta_hedge_threshold=0.1,
                  start_date=None,
@@ -578,12 +579,14 @@ class VolatilityArbitrageStrategy:
         end_date: End date for backtest (for CSV naming)
         """
         self.iv_threshold = iv_threshold
+        self.iv_exit_threshold = iv_threshold / 2  # Exit threshold
         self.risk_free_rate = risk_free_rate
         self.transaction_cost = transaction_cost
         self.max_position_size = max_position_size
         self.delta_hedge_threshold = delta_hedge_threshold
         self.start_date = start_date
         self.end_date = end_date
+        self.close_n_days_to_expiry = 5  # Close positions close to expiry
         
         self.sabr_model = SABRModel()
         self.positions = {}
@@ -1327,7 +1330,7 @@ class VolatilityArbitrageStrategy:
         
         opportunities = []
         day_data = self.options_data[self.options_data['trade_date'] == trade_date]
-        
+        closing_option_ids=[]
         for exp_date, sabr_params in sabr_params_by_maturity.items():
             exp_data = day_data[day_data['expiration_date'] == exp_date]
             
@@ -1338,13 +1341,15 @@ class VolatilityArbitrageStrategy:
                 option_type = option['cp_flag']
                 time_to_maturity = option['tte']
                 option_id = option['option_symbol']
-                
+                have_position = False
                 if option_id not in self.positions or self.positions[option_id].quantity ==0:
                     if time_to_maturity < self.least_dte_to_open / 365.25:
                         continue
                     moneyness = abs(strike / underlying_price - 1)
                     if moneyness > self.max_moneyness_to_open:
                         continue
+                else:
+                    have_position = True
 
                 # Calculate market IV
                 risk_free_rate = self.get_risk_free_rate(trade_date)
@@ -1413,21 +1418,32 @@ class VolatilityArbitrageStrategy:
                     }
                     # print(f"Arbitrage opportunity: {opportunity}")
                     opportunities.append(opportunity)
-        
-        return opportunities
+                elif have_position and abs(iv_diff) < self.iv_exit_threshold:
+                    closing_option_ids.append(option_id)
+
+        return opportunities, closing_option_ids
     
     def execute_trade(self, opportunity):
         """Execute a volatility arbitrage trade"""
         action = opportunity['action']
         position_size = min(self.max_position_size, 10)  # Conservative sizing
         
+        if opportunity['option_id'] in self.positions:
+            existing_position = self.positions[opportunity['option_id']]
+            prev_price = existing_position.cur_price
+            prev_quantity = existing_position.quantity
+        else:
+            prev_quantity = 0
+            prev_price = 0.0
         if action == 'BUY':
             quantity = position_size
         else:
             quantity = -position_size
-        
+        quantity_change = quantity - prev_quantity
+        if quantity_change == 0:
+            return  False# No change in position
         # Calculate transaction cost
-        notional = opportunity['market_price'] * abs(quantity) * 100  # Options are per 100 shares
+        notional = opportunity['market_price'] * abs(quantity_change) * 100  # Options are per 100 shares
         transaction_cost = notional * self.transaction_cost
         
         # Create position
@@ -1450,14 +1466,15 @@ class VolatilityArbitrageStrategy:
             vega=opportunity['vega'],
             underlying_price=opportunity['underlying_price'],
             cur_price=opportunity['market_price'],  # Initialize current price
-            prev_price=opportunity['market_price'],  # Initialize previous price
+            prev_price=prev_price,  # Initialize previous price
+            prev_quantity=prev_quantity,
             cur_date=opportunity['trade_date']  # Initialize current date
         )
         
         self.positions[option_id] = position
         
         # Update cash position (no individual delta hedging - will be handled by daily_delta_hedge)
-        cash_flow = -quantity * opportunity['market_price'] * 100 - transaction_cost
+        cash_flow = -quantity_change * opportunity['market_price'] * 100 - transaction_cost
         self.cash += cash_flow
         
         # Log trade (no individual hedging recorded)
@@ -1474,10 +1491,10 @@ class VolatilityArbitrageStrategy:
         }
         
         self.trade_log.append(trade_record)
-        
-        logger.info(f"Executed {action} {abs(quantity)} {option_id} @ {opportunity['market_price']:.2f}, "
+
+        logger.info(f"Executed {action} {abs(quantity_change)}({prev_quantity}=>{quantity}) {option_id} @ {opportunity['market_price']:.2f}, "
                    f"IV diff: {opportunity['iv_diff']:.1%}, (delta: {opportunity['delta']:.3f}), underlyingP:{opportunity['underlying_price']}, ")
-    
+        return True
     def _save_position_hedge_details(self, position_details):
         """Save individual position hedge details to CSV"""
         if not position_details:
@@ -1601,7 +1618,7 @@ class VolatilityArbitrageStrategy:
                 # Entry information
                 'entry_price', 'entry_date', 'entry_iv', 'predicted_iv', 'entry_value',
                 # Current pricing and P&L
-                'prev_price', 'cur_price', 'price_change', 'current_value', 'position_pnl',
+                'prev_price', 'cur_price', 'prev_quantity', 'price_change', 'current_value', 'position_pnl',
                 # Time tracking
                 'days_held', 'days_to_expiry', 'time_to_maturity',
                 # Greeks and hedging
@@ -1764,73 +1781,82 @@ class VolatilityArbitrageStrategy:
         
         # Save summary to CSV
         self._save_hedge_summary(summary_data)
-    
-    def close_expired_positions(self, current_date):
-        """Close positions that have expired"""
+
+    def close_expiring_and_converged_positions(self, current_date, closing_option_ids):
+        """Close positions that have expired or converged"""
         expired_option_ids = []
+        ### short positions: ITM: close before last trading day
+        ### short positions: OTM: if very deep, let it expire
+        ### long positions: ITM:  close before last trading day
+        ### long positions: OTM: close beofore last trading day
         
         # Find expired positions
+        current_data = self.options_data[self.options_data['trade_date'] == current_date]
         for option_id, position in self.positions.items():
-            if position.expiration_date <= current_date:
+            if position.expiration_date <= (current_date+ timedelta(days=self.close_n_days_to_expiry)):
                 expired_option_ids.append(option_id)
         
         # Remove expired positions
-        for option_id in expired_option_ids:
-            position = self.positions.pop(option_id)
-            
-            # Calculate final payoff
-            payoff = 0
-            cash_flow = 0
-            final_underlying = 0
-            
-            # Ensure data is loaded for expiration calculation
-            if self.ensure_data_loaded_for_date(current_date):
-                current_data = self.options_data[
-                    (self.options_data['trade_date'] <= current_date) &
-                    (self.options_data['expiration_date'] == position.expiration_date)
-                ]
+        to_close_ids = [('expiring', expired_option_ids), ('converged', closing_option_ids)]
+        for reason, option_ids in to_close_ids:
+            for option_id in option_ids:
+                position = self.positions.pop(option_id)
                 
-                if len(current_data) > 0:
-                    final_underlying = current_data['underlying_price'].iloc[-1]
-                    
-                    if position.option_type == 'C':
-                        payoff = max(0, final_underlying - position.strike)
-                    else:
-                        payoff = max(0, position.strike - final_underlying)
-                    
-                    cash_flow = position.quantity * payoff * 100
-                    self.cash += cash_flow
-                    
-                    logger.info(f"Expired: {option_id}, Payoff: {payoff:.2f}, "
-                               f"Cash flow: {cash_flow:.2f}")
-            
-            # Log expired position to CSV
-            expiry_data = {
-                'date': current_date,
-                'action_type': 'position_expiry',
-                'option_id': option_id,
-                'expiration_date': position.expiration_date,
-                'payoff': payoff,
-                'cash_flow': cash_flow,
-                'quantity': position.quantity,
-                'strike': position.strike,
-                'option_type': position.option_type,
-                'final_underlying': final_underlying,
-                'total_delta_exposure': 0,  # Not applicable for expiry
-                'current_stock_position': self.stock_position,
-                'total_delta_adjustment': 0,  # Not applicable for expiry
-                'threshold_shares': 0,  # Not applicable for expiry
-                'hedge_executed': False,  # Not applicable for expiry
-                'underlying_price': final_underlying,
-                'num_positions': 1,
-                'old_stock_position': self.stock_position,
-                'new_stock_position': self.stock_position,
-                'stock_adjustment': 0
-            }
-            
-            self._save_hedge_summary(expiry_data)
-    
-    def calculate_portfolio_value(self, current_date):
+                # Calculate final payoff
+                payoff = 0
+                cash_flow = 0
+                final_underlying = 0
+                
+                # Ensure data is loaded for expiration calculation
+                if self.ensure_data_loaded_for_date(current_date):
+                    # current_data = self.options_data[
+                    #     (self.options_data['trade_date'] <= current_date) &
+                    #     (self.options_data['expiration_date'] == position.expiration_date)
+                    # ]
+                    ##### TODO: check if we can simply do trade_date == current_date
+                    id_data = current_data[current_data['option_symbol'] == option_id]
+
+                    if len(id_data) > 0:
+                        final_underlying = id_data['underlying_price'].iloc[-1]
+
+                        if position.option_type == 'C':
+                            payoff = max(0, final_underlying - position.strike)
+                        else:
+                            payoff = max(0, position.strike - final_underlying)
+                        
+                        cash_flow = position.quantity * payoff * 100
+                        self.cash += cash_flow
+                        
+                        logger.info(f"Expired: {option_id}, Payoff: {payoff:.2f}, "
+                                f"Cash flow: {cash_flow:.2f}")
+                
+                # Log expired position to CSV
+                closing_data = {
+                    'date': current_date,
+                    'action_type': reason,
+                    'option_id': option_id,
+                    'expiration_date': position.expiration_date,
+                    'payoff': payoff,
+                    'cash_flow': cash_flow,
+                    'quantity': position.quantity,
+                    'strike': position.strike,
+                    'option_type': position.option_type,
+                    'final_underlying': final_underlying,
+                    'total_delta_exposure': 0,  # Not applicable for expiry
+                    'current_stock_position': self.stock_position,
+                    'total_delta_adjustment': 0,  # Not applicable for expiry
+                    'threshold_shares': 0,  # Not applicable for expiry
+                    'hedge_executed': False,  # Not applicable for expiry
+                    'underlying_price': final_underlying,
+                    'num_positions': 1,
+                    'old_stock_position': self.stock_position,
+                    'new_stock_position': self.stock_position,
+                    'stock_adjustment': 0
+                }
+
+                self._save_hedge_summary(closing_data)
+
+    def calculate_portfolio_value(self, current_date, add_or_updated_ids):
         """Calculate current portfolio value and update position prices"""
         if not self.positions:
             return self.cash
@@ -1861,11 +1887,12 @@ class VolatilityArbitrageStrategy:
         # Add option positions value and update position prices
         sorted_positions = sorted([(oid, pos) for oid, pos in self.positions.items() if pos.quantity != 0], key=lambda x: x[0])
         for option_id, position in sorted_positions:
-            option_data = current_data[
-                (current_data['expiration_date'] == position.expiration_date) &
-                (current_data['price_strike'] == position.strike) &
-                (current_data['cp_flag'] == position.option_type)
-            ]
+            # option_data = current_data[
+            #     (current_data['expiration_date'] == position.expiration_date) &
+            #     (current_data['price_strike'] == position.strike) &
+            #     (current_data['cp_flag'] == position.option_type)
+            # ]
+            option_data= current_data[current_data['option_symbol'] == option_id]
             
             if len(option_data) > 0:
                 current_price = option_data.iloc[0]['price_close']
@@ -1920,6 +1947,7 @@ class VolatilityArbitrageStrategy:
                     # Current pricing and P&L
                     'prev_price': position.prev_price,
                     'cur_price': position.cur_price,
+                    'prev_quantity': position.prev_quantity if option_id in add_or_updated_ids else position.quantity,
                     'price_change': position.cur_price - position.prev_price,
                     'current_value': current_value,
                     'position_pnl': position_pnl,
@@ -2015,8 +2043,6 @@ class VolatilityArbitrageStrategy:
         for i, trade_date in enumerate(trading_dates):
             logger.info(f"Processing {trade_date.strftime('%Y-%m-%d')} ({i+1}/{len(trading_dates)})")
             
-            # Close expired positions
-            self.close_expired_positions(trade_date)
             
             # Get SABR calibration results
             if precomputed_calibration and trade_date in precomputed_calibration:
@@ -2056,20 +2082,34 @@ class VolatilityArbitrageStrategy:
                 continue
             
             # Identify arbitrage opportunities
-            opportunities = self.identify_arbitrage_opportunities(trade_date, sabr_params_by_maturity)
-            
+            opportunities, closing_option_ids = self.identify_arbitrage_opportunities(trade_date, sabr_params_by_maturity)
+
             # Execute top opportunities (limit to avoid over-trading)
             opportunities.sort(key=lambda x: abs(x['iv_diff']), reverse=True)
+            add_or_updated_ids = set()
             for opportunity in opportunities[:5]:  # Top 5 opportunities per day
-                self.execute_trade(opportunity)
+                if opportunity['option_id'] in self.positions and self.positions[opportunity['option_id']].quantity != 0:
+                    if self.positions[opportunity['option_id']].quantity>0 and opportunity['action']=='BUY':
+                        ### TODO: consider add more positions
+                        continue  # Skip if already have same position in this option
+                    elif self.positions[opportunity['option_id']].quantity<0 and opportunity['action']=='SELL':
+                        continue  # Skip if already have same position in this option
+                add_or_updated = self.execute_trade(opportunity)
+                if add_or_updated:
+                    add_or_updated_ids.add(opportunity['option_id'])
             
+            
+            # Close expired positions
+            self.close_expiring_and_converged_positions(trade_date, closing_option_ids)
+
+
             # Daily delta hedging AFTER executing trades
             # Always run delta hedging to ensure proper portfolio balance
             # (even when positions net to zero, stock position should be adjusted)
             self.daily_delta_hedge(trade_date)
             
             # Calculate and record portfolio value
-            portfolio_value = self.calculate_portfolio_value(trade_date)
+            portfolio_value = self.calculate_portfolio_value(trade_date, add_or_updated_ids)
             pnl = portfolio_value - initial_capital
             num_positions = len([pos for pos in self.positions.values() if pos.quantity != 0])
             
